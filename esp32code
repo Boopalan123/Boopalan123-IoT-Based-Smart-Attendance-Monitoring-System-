@@ -1,0 +1,488 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Adafruit_Fingerprint.h>
+#include <HardwareSerial.h>
+#include <map>
+#include <vector>
+#include <time.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <SPIFFS.h>
+
+// WiFi credentials
+const char* ssid = "boobalan";
+const char* password = "123456798";
+
+WebServer server(80);
+HardwareSerial mySerial(2);
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
+LiquidCrystal_I2C lcd(0x3F, 16, 2);
+
+int enrollID = 0;
+String enrollName = "";
+bool enrollRequested = false;
+bool attendanceMode = false;
+
+struct Attendance {
+  int id;
+  String name;
+  String timestamp;
+};
+
+
+std::map<int, String> userNames;
+std::vector<Attendance> attendanceLog;
+
+// CSS for HTML pages
+String css = R"rawliteral(
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f9f9f9;
+      margin: 20px auto;
+      max-width: 800px;
+      color: #333;
+    }
+    a {
+      color: #007bff;
+      text-decoration: none;
+      margin-right: 15px;
+      font-weight: bold;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+    h2 {
+      color: #222;
+      border-bottom: 2px solid #007bff;
+      padding-bottom: 5px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      box-shadow: 0 0 5px rgba(0,0,0,0.1);
+    }
+    th, td {
+      padding: 8px 12px;
+      border: 1px solid #ddd;
+      text-align: left;
+    }
+    th {
+      background-color: #007bff;
+      color: white;
+    }
+    tr:nth-child(even) {
+      background-color: #f2f2f2;
+    }
+    input[type=number], input[type=text] {
+      padding: 6px;
+      margin: 4px 0;
+      box-sizing: border-box;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      width: 200px;
+    }
+    input[type=submit] {
+      background-color: #007bff;
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    input[type=submit]:hover {
+      background-color: #0056b3;
+    }
+    hr {
+      margin: 20px 0;
+      border: none;
+      border-bottom: 1px solid #ddd;
+    }
+  </style>
+)rawliteral";
+
+// Helper to print two lines on LCD
+
+void lcdPrintLine(const char* line1, const char* line2 = "") {
+  lcd.clear(); lcd.setCursor(0,0); lcd.print(line1); lcd.setCursor(0,1); lcd.print(line2);
+}
+
+String getCurrentTimestamp() {
+  time_t now = time(nullptr);
+  struct tm* t = localtime(&now);
+  char buffer[30];
+  sprintf(buffer, "%04d-%02d-%02d %02d:%02d:%02d",
+          t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+          t->tm_hour, t->tm_min, t->tm_sec);
+  return String(buffer);
+}
+
+void saveUserNamesToSPIFFS() {
+  File file = SPIFFS.open("/users.txt", FILE_WRITE);
+  if (!file) return;
+  for (const auto& pair : userNames) {
+    file.printf("%d,%s\n", pair.first, pair.second.c_str());
+  }
+  file.close();
+}
+
+void loadUserNamesFromSPIFFS() {
+  File file = SPIFFS.open("/users.txt", FILE_READ);
+  if (!file) return;
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    int commaIndex = line.indexOf(',');
+    if (commaIndex > 0) {
+      int id = line.substring(0, commaIndex).toInt();
+      String name = line.substring(commaIndex + 1);
+      name.trim();
+      userNames[id] = name;
+    }
+  }
+  file.close();
+}
+
+void setup() {
+  Serial.begin(115200);
+  mySerial.begin(57600, SERIAL_8N1, 16, 17);
+  finger.begin(57600);
+  lcd.init(); lcd.backlight(); lcdPrintLine("Initializing...");
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS Mount Failed");
+    return;
+  }
+
+  if (finger.verifyPassword()) {
+    Serial.println("Fingerprint sensor found");
+    lcdPrintLine("Fingerprint", "sensor found");
+  } else {
+    Serial.println("Fingerprint sensor not found");
+    lcdPrintLine("Fingerprint", "sensor NOT found");
+    while (1) delay(1);
+  }
+   WiFi.mode(WIFI_OFF);        //Prevents reconnection issue (taking too long to connect)
+    delay(1000);
+    WiFi.mode(WIFI_STA);
+    Serial.print("Connecting to ");
+    Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("WiFi connected");
+  lcdPrintLine("WiFi connected", WiFi.localIP().toString().c_str());
+
+  configTime(5 * 3600, 30 * 60, "pool.ntp.org", "time.nist.gov");
+  while (time(nullptr) < 8 * 3600 * 2) delay(500);
+
+  loadUserNamesFromSPIFFS();
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/users", HTTP_GET, handleUsers);
+  server.on("/enroll", HTTP_POST, handleEnroll);
+  server.on("/delete", HTTP_POST, handleDelete);
+  server.on("/mode", HTTP_POST, handleMode);
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  if (enrollRequested) {
+    lcdPrintLine("Enrollment", "Starting...");
+    deleteFingerprint(enrollID);
+    if (doEnrollment(enrollID)) {
+      userNames[enrollID] = enrollName;
+      saveUserNamesToSPIFFS();
+      lcdPrintLine("Enroll", "Success!");
+    } else {
+      lcdPrintLine("Enroll", "Failed!");
+    }
+    enrollRequested = false;
+    delay(2000);
+  }
+
+  if (attendanceMode) {
+    getFingerprintID();
+  }
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>" + css + "</head><body>";
+
+  html += R"rawliteral(
+    <a href="/users">View Enrolled Users</a> |
+    <a href="#attendance">Attendance Log</a>
+    <hr>
+
+    <h2 id="enroll">Fingerprint Enroll</h2>
+    <form action="/enroll" method="post">
+      Enter ID (1-127): <input type="number" name="id" min="1" max="127" required><br>
+      Enter Name: <input type="text" name="name" required><br>
+      <input type="submit" value="Enroll">
+    </form>
+    <br>
+
+    <h2>Delete Fingerprint</h2>
+    <form action="/delete" method="post">
+      Enter ID to delete: <input type="number" name="id" min="1" max="127" required>
+      <input type="submit" value="Delete">
+    </form>
+    <br>
+
+    <h2 id="attendance">Attendance Mode</h2>
+    <form action="/mode" method="post">
+      <input type="submit" name="mode" value="Start Attendance">
+      <input type="submit" name="mode" value="Stop Attendance">
+    </form>
+    <hr>
+
+    <h2 id="attendance">Attendance Log</h2>
+    <table border="1">
+      <tr><th>ID</th><th>Name</th><th>Timestamp</th></tr>
+  )rawliteral";
+
+  for (const auto& record : attendanceLog) {
+    html += "<tr><td>" + String(record.id) + "</td><td>" + record.name + "</td><td>" + record.timestamp + "</td></tr>";
+  }
+
+  html += R"rawliteral(
+    </table>
+    </body>
+    </html>
+  )rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void handleUsers() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>" + css + "</head><body>";
+  html += R"rawliteral(
+    <a href="/">Home</a>
+    <hr>
+    <h2>Enrolled Users</h2>
+    <table border="1">
+      <tr><th>ID</th><th>Name</th></tr>
+  )rawliteral";
+
+  for (const auto& entry : userNames) {
+    html += "<tr><td>" + String(entry.first) + "</td><td>" + entry.second + "</td></tr>";
+  }
+
+  html += R"rawliteral(
+    </table>
+    </body>
+    </html>
+  )rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void handleEnroll() {
+  if (server.hasArg("id") && server.hasArg("name")) {
+    enrollID = server.arg("id").toInt();
+    enrollName = server.arg("name");
+    if (enrollID >= 1 && enrollID <= 127) {
+      enrollRequested = true;
+      server.send(200, "text/html", "<h3>Enrollment started. Check Serial Monitor and LCD.</h3><a href='/'>Back</a>");
+    } else {
+      server.send(400, "text/html", "<h3>Invalid ID. Must be between 1 and 127.</h3><a href='/'>Back</a>");
+    }
+  } else {
+    server.send(400, "text/html", "<h3>ID and Name required.</h3><a href='/'>Back</a>");
+  }
+}
+
+void handleDelete() {
+  if (server.hasArg("id")) {
+    int id = server.arg("id").toInt();
+    if (deleteFingerprint(id)) {
+      userNames.erase(id);
+      server.send(200, "text/html", "<h3>Deleted Successfully.</h3><a href='/'>Back</a>");
+      Serial.println("Deleted fingerprint ID " + String(id));
+      lcdPrintLine("Deleted ID:", String(id).c_str());
+      delay(2000);
+      lcd.clear();
+    } else {
+      server.send(500, "text/html", "<h3>Delete Failed.</h3><a href='/'>Back</a>");
+      Serial.println("Failed to delete fingerprint ID " + String(id));
+      lcdPrintLine("Delete Failed", String(id).c_str());
+      delay(2000);
+      lcd.clear();
+    }
+  } else {
+    server.send(400, "text/html", "<h3>ID required.</h3><a href='/'>Back</a>");
+}
+}
+
+void handleMode() {
+if (server.hasArg("mode")) {
+String mode = server.arg("mode");
+if (mode == "Start Attendance") {
+attendanceMode = true;
+server.send(200, "text/html", "<h3>Attendance started.</h3><a href='/'>Back</a>");
+Serial.println("Attendance Mode Started");
+lcdPrintLine("Attendance", "Started");
+delay(2000);
+lcd.clear();
+} else if (mode == "Stop Attendance") {
+attendanceMode = false;
+server.send(200, "text/html", "<h3>Attendance stopped.</h3><a href='/'>Back</a>");
+Serial.println("Attendance Mode Stopped");
+lcdPrintLine("Attendance", "Stopped");
+delay(2000);
+lcd.clear();
+} else {
+server.send(400, "text/html", "<h3>Invalid Mode.</h3><a href='/'>Back</a>");
+}
+} else {
+server.send(400, "text/html", "<h3>Mode argument missing.</h3><a href='/'>Back</a>");
+}
+}
+
+bool deleteFingerprint(int id) {
+Serial.print("Deleting fingerprint ID ");
+Serial.println(id);
+lcdPrintLine("Deleting ID:", String(id).c_str());
+int p = finger.deleteModel(id);
+if (p == FINGERPRINT_OK) {
+Serial.println("Deleted successfully");
+lcdPrintLine("Deleted ID:", String(id).c_str());
+delay(2000);
+lcd.clear();
+return true;
+} else {
+Serial.print("Delete failed: ");
+Serial.println(p);
+lcdPrintLine("Delete failed", String(p).c_str());
+delay(2000);
+lcd.clear();
+return false;
+}
+}
+
+bool doEnrollment(int id) {
+int p = -1;
+
+Serial.print("Waiting for valid finger to enroll ID ");
+Serial.println(id);
+lcdPrintLine("Place finger", "to enroll");
+
+// Step 1: Capture first fingerprint image
+while (p != FINGERPRINT_OK) {
+p = finger.getImage();
+switch (p) {
+case FINGERPRINT_OK:
+Serial.println("Image taken");
+lcdPrintLine("Image", "Captured");
+break;
+case FINGERPRINT_NOFINGER:
+// wait
+break;
+case FINGERPRINT_PACKETRECIEVEERR:
+case FINGERPRINT_IMAGEFAIL:
+default:
+Serial.println("Failed to capture image");
+lcdPrintLine("Image", "Failed");
+delay(500);
+return false;
+}
+}
+
+p = finger.image2Tz(1);
+if (p != FINGERPRINT_OK) {
+Serial.println("Failed to convert image");
+lcdPrintLine("Convert", "Failed");
+return false;
+}
+
+Serial.println("Remove finger");
+lcdPrintLine("Remove", "Finger");
+delay(2000);
+
+// Step 2: Capture second fingerprint image
+p = -1;
+Serial.println("Place same finger again");
+lcdPrintLine("Place same", "finger again");
+delay(500); 
+while (p != FINGERPRINT_OK) {
+p = finger.getImage();
+switch (p) {
+case FINGERPRINT_OK:
+Serial.println("Image taken");
+lcdPrintLine("Image", "Captured");
+break;
+case FINGERPRINT_NOFINGER:
+// wait
+break;
+case FINGERPRINT_PACKETRECIEVEERR:
+case FINGERPRINT_IMAGEFAIL:
+default:
+Serial.println("Failed to capture image");
+lcdPrintLine("Image", "Failed");
+delay(500);
+return false;
+}
+}
+
+p = finger.image2Tz(2);
+if (p != FINGERPRINT_OK) {
+Serial.println("Failed to convert image");
+lcdPrintLine("Convert", "Failed");
+return false;
+}
+
+Serial.println("Creating model...");
+lcdPrintLine("Creating", "Model");
+p = finger.createModel();
+if (p != FINGERPRINT_OK) {
+Serial.println("Failed to create model");
+lcdPrintLine("Create model", "Failed");
+return false;
+}
+
+Serial.print("Storing model at ID ");
+Serial.println(id);
+lcdPrintLine("Storing", ("ID " + String(id)).c_str());
+p = finger.storeModel(id);
+if (p != FINGERPRINT_OK) {
+Serial.println("Failed to store model");
+lcdPrintLine("Store model", "Failed");
+return false;
+}
+
+return true;
+}
+
+void getFingerprintID() {
+uint8_t p = finger.getImage();
+if (p != FINGERPRINT_OK) return;
+
+p = finger.image2Tz();
+if (p != FINGERPRINT_OK) return;
+
+p = finger.fingerFastSearch();
+if (p != FINGERPRINT_OK) {
+Serial.println("No match found");
+lcdPrintLine("No match", "");
+delay(1000);
+lcd.clear();
+return;
+}
+
+int id = finger.fingerID;
+Serial.print("Found ID #"); Serial.println(id);
+String name = userNames.count(id) ? userNames[id] : "Unknown";
+String time = getCurrentTimestamp();
+
+Serial.print("Name: "); Serial.println(name);
+Serial.print("Time: "); Serial.println(time);
+lcdPrintLine(("ID " + String(id)).c_str(), name.c_str());
+
+attendanceLog.push_back({id, name, time});
+delay(3000);
+lcd.clear();
+}
